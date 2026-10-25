@@ -355,6 +355,10 @@ te_enabled_name: "Attivo / Nome"
 tt_dep_target_backup: "Prima di sovrascrivere il binario sul\ndispositivo, lo copia in <target_path>.bak\nper un rollback con un singolo mv."
 te_pre_command: "Comandi pre-deploy"
 te_post_command: "Comandi post-deploy"
+te_scp_mode: "Modalità SCP"
+te_scp_mode_last_working: "Last working"
+te_scp_mode_automatic: "Automatic"
+tt_scp_mode: "Last working (default): prova prima la modalità memorizzata\ne ricade sulla catena completa solo se fallisce.\nAutomatic: sempre default → SFTP (-s) → SCP protocol (-O)."
 
 # Notifications / Messages
 no_target_selected: "Nessun target selezionato"

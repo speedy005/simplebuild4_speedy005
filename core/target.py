@@ -39,6 +39,14 @@ class DeploymentConfig:
     su_password: str = ""              # encrypted, root password for su -c wrapping
     pre_cmd: str = ""
     post_cmd: str = ""
+    # SCP transfer mode selector:
+    #  "last_working" (default) — try the cached mode first; on failure
+    #    rerun the full fallback chain and remember what worked.
+    #  "automatic" — always run the full fallback chain, cache nothing.
+    scp_mode: str = "last_working"
+    # Cached mode that last succeeded, written by the deployer:
+    # "", "default", "sftp" or "scp_protocol". Not meant for manual edits.
+    last_working_scp_mode: str = ""
 
 
 # Backward compat alias
@@ -146,6 +154,23 @@ class Target:
     deployment: list[DeploymentConfig] = field(default_factory=list)
     exclude_from_automation: bool = False
     delete_binary_after_deploy: bool = False
+    # Path this target was loaded from, so the deployer can persist
+    # cached scp_mode updates without the caller passing a save path.
+    # Not serialized to YAML. Set by Target.load(); None for in-memory
+    # instances built from scratch.
+    _source_path: "Path | None" = field(default=None, repr=False, compare=False)
+
+    def save_in_place(self) -> bool:
+        """Persist back to the file this target was loaded from.
+
+        Returns True on write, False when the target has no source path
+        (freshly created / unsaved). Callers that only need to flush a
+        deployer-side cache update can call this and ignore the result.
+        """
+        if self._source_path is None:
+            return False
+        self.save(self._source_path)
+        return True
 
     def save(self, path: Path) -> None:
         """Save target to YAML file."""
@@ -209,6 +234,9 @@ class Target:
                     "su_password": _encrypt(u.su_password),
                     "pre_cmd": u.pre_cmd,
                     "post_cmd": u.post_cmd,
+                    # Omit default to keep YAML tidy; load() falls back to it.
+                    "scp_mode": u.scp_mode if u.scp_mode != "last_working" else "",
+                    "last_working_scp_mode": u.last_working_scp_mode,
                 }.items() if not (v == "" or v is None or (v == 0 and v is not False))}
                 for u in self.deployment
                 if u.host  # only save entries with a host
@@ -320,9 +348,11 @@ class Target:
                 su_password=_decrypt(u.get("su_password", ""), label=lambda tn=_tgt_name, di=_dep_id: f"{t('te_su_password')} (Target '{tn}' / '{di}')"),
                 pre_cmd=u.get("pre_cmd", ""),
                 post_cmd=u.get("post_cmd", ""),
+                scp_mode=u.get("scp_mode", "") or "last_working",
+                last_working_scp_mode=u.get("last_working_scp_mode", ""),
             ))
 
-        return cls(
+        obj = cls(
             name=data.get("name", ""),
             description=data.get("description", ""),
             sources=_load_sources(data.get("sources", [{"name": "default"}])),
@@ -332,6 +362,8 @@ class Target:
             exclude_from_automation=bool(data.get("exclude_from_automation", False)),
             delete_binary_after_deploy=bool(data.get("delete_binary_after_deploy", False)),
         )
+        obj._source_path = path
+        return obj
 
     @classmethod
     def list_targets(cls, targets_dir: Path) -> list[tuple[str, Path]]:

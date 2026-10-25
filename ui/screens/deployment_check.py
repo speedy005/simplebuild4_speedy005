@@ -14,7 +14,7 @@ from textual.screen import ModalScreen
 from textual.widgets import Static, RichLog, Button, Select
 from ui.widgets.artifact_richlog import ArtifactRichLog
 
-from core.target import DeploymentConfig
+from core.target import DeploymentConfig, Target
 from core.deployer import Deployer
 from translation import t
 from ui.icons import is_ascii
@@ -73,7 +73,8 @@ class DeploymentCheckModal(ModalScreen[None]):
                  binaries_dir: Optional[Path] = None,
                  logs_dir: Optional[Path] = None,
                  toolchain_filter: str = "",
-                 delete_binary_after_deploy: bool = False) -> None:
+                 delete_binary_after_deploy: bool = False,
+                 target: "Target | None" = None) -> None:
         super().__init__()
         self._deployments = [d for d in deployments if d.host]
         self._target_name = target_name
@@ -84,6 +85,9 @@ class DeploymentCheckModal(ModalScreen[None]):
         self._binary_path: Optional[Path] = None
         self._delete_binary_after_deploy = delete_binary_after_deploy
         self._delete_confirm_time = 0.0
+        # Optional parent target — only used so the deployer's cached
+        # scp_mode updates can be persisted via target.save_in_place().
+        self._target = target
 
     def compose(self) -> ComposeResult:
         bin_options = [(t("dc_dry_run"), "dry-run")]
@@ -203,6 +207,10 @@ class DeploymentCheckModal(ModalScreen[None]):
             log(f"[yellow]{t('dc_delete_binary_warn').format(name=binary_path.name)}[/yellow]")
         log("")
 
+        # Snapshot cached SCP modes so a dry-run can be ignored and a
+        # real deploy can persist whatever the fallback chain discovered.
+        scp_cache_before = [d.last_working_scp_mode for d in self._deployments]
+
         all_ok = True
         for idx, d in enumerate(self._deployments):
             name = d.name or f"#{idx + 1}"
@@ -226,6 +234,24 @@ class DeploymentCheckModal(ModalScreen[None]):
             if not deployer.run():
                 all_ok = False
             log("")
+
+        # Persist SCP cache updates \u2014 only after a real deploy, never
+        # from a dry run (dry run doesn't actually transfer anything).
+        # The tested deployment objects may be a fresh _collect() of the
+        # UI (not identity-equal to the entries in self._target), so merge
+        # cached-mode updates back by (host, port, user, target_path).
+        if (not is_dry_run and self._target is not None
+                and [d.last_working_scp_mode for d in self._deployments] != scp_cache_before):
+            for tested in self._deployments:
+                for orig in self._target.deployment:
+                    if (orig.host == tested.host and orig.port == tested.port
+                            and orig.user == tested.user and orig.target_path == tested.target_path):
+                        orig.last_working_scp_mode = tested.last_working_scp_mode
+                        break
+            try:
+                self._target.save_in_place()
+            except Exception:
+                pass
 
         if self._delete_binary_after_deploy and binary_path is not None:
             try:

@@ -892,8 +892,26 @@ class TargetEditScreen(Screen):
                             _sp(), _sp(), _sp(),
                             classes="s-row",
                         )
-                        # Row 3 left: (empty placeholder for grid alignment)
-                        yield Horizontal(classes="s-row")
+                        # Row 3 left: SCP mode selector (previously empty).
+                        # Width mirrors the pre/post command input so the
+                        # row aligns with the other input-wide fields.
+                        _scp_mode_val = up.scp_mode if up.scp_mode in ("last_working", "automatic") else "last_working"
+                        _scp_sel = Select(
+                            options=[
+                                (t("te_scp_mode_last_working"), "last_working"),
+                                (t("te_scp_mode_automatic"), "automatic"),
+                            ],
+                            value=_scp_mode_val,
+                            id=f"t-dep-scpmode-{idx}",
+                            allow_blank=False,
+                        )
+                        _scp_sel.tooltip = t("tt_scp_mode")
+                        _scp_sel.styles.width = "1fr"
+                        yield Horizontal(
+                            Static(f" {t('te_scp_mode')}", classes="s-label-tall"),
+                            _scp_sel,
+                            classes="s-row",
+                        )
                         # Row 3 right: SSH Key + browse
                         yield Horizontal(
                             Static(f" {t('te_ssh_key')}", classes="s-label-tall"),
@@ -1931,6 +1949,9 @@ class TargetEditScreen(Screen):
             binaries_dir=self.app.paths.binaries_dir,
             logs_dir=self.app.paths.logs_dir,
             delete_binary_after_deploy=target.delete_binary_after_deploy,
+            # Needed so the deployer's scp_mode cache update is persisted;
+            # self.target is the live object whose _source_path is set.
+            target=self.target,
         ))
 
     def do_add(self) -> None:
@@ -2133,6 +2154,16 @@ class TargetEditScreen(Screen):
                 target_backup = self.query_one(f"#t-dep-backup-{idx}", Checkbox).value
             except Exception:
                 target_backup = False
+            try:
+                _sm = self.query_one(f"#t-dep-scpmode-{idx}", Select).value
+                scp_mode = str(_sm) if _sm and _sm is not Select.BLANK else "last_working"
+            except Exception:
+                scp_mode = "last_working"
+            # Carry the cached mode across saves — it's deployer state,
+            # not editable in the UI; the original up entry still has it.
+            prev_cached = ""
+            if idx < len(self.target.deployment):
+                prev_cached = self.target.deployment[idx].last_working_scp_mode
             deployment.append(DeploymentConfig(
                 name=up_name,
                 enabled=enabled,
@@ -2148,6 +2179,8 @@ class TargetEditScreen(Screen):
                 su_password=su_password,
                 pre_cmd=self.query_one(f"#t-dep-pre-{idx}", Input).value.strip(),
                 post_cmd=self.query_one(f"#t-dep-post-{idx}", Input).value.strip(),
+                scp_mode=scp_mode,
+                last_working_scp_mode=prev_cached,
             ))
 
         try:

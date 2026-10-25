@@ -1031,6 +1031,10 @@ class BuildEngine:
                 f"{bin_path.name}[/yellow]"
             )
 
+        # Snapshot cached SCP modes so we can detect — and persist —
+        # any updates the deployer writes back during the run.
+        scp_cache_before = [d.last_working_scp_mode for d in deployments]
+
         all_ok = True
         for d in deployments:
             if self._cancel():
@@ -1048,6 +1052,15 @@ class BuildEngine:
             )
             if not deployer.run(verbose=False):
                 all_ok = False
+
+        # Flush any SCP mode cache updates back to the target file so the
+        # next build/deploy benefits. Silent on error — persistence is a
+        # convenience, not something to fail the build over.
+        if [d.last_working_scp_mode for d in deployments] != scp_cache_before:
+            try:
+                self.target.save_in_place()
+            except Exception:
+                pass
 
         # Post-loop delete — only when every destination succeeded, a
         # real binary is on disk, and the target has the flag set. Log

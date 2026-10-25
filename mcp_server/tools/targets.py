@@ -88,6 +88,8 @@ def _target_summary(target: Target) -> dict[str, Any]:
             "target_backup": bool(getattr(d, "target_backup", False)),
             "pre_cmd": getattr(d, "pre_cmd", ""),
             "post_cmd": getattr(d, "post_cmd", ""),
+            "scp_mode": getattr(d, "scp_mode", "last_working") or "last_working",
+            "last_working_scp_mode": getattr(d, "last_working_scp_mode", ""),
         })
 
     sources = [
@@ -262,6 +264,19 @@ def _apply_patch_to_target(target: Target, patch: dict[str, Any]) -> None:
             host = str(d.get("host", ""))
             user = str(d.get("user", "root"))
             preserved = old_by_key.get(_dkey(name, host, user))
+            # scp_mode: honour the patch; fall back to the preserved
+            # value (or "last_working" default) if the LLM omits it, so
+            # a round-trip edit never silently resets the user's choice.
+            _scp_mode = str(d.get("scp_mode", "")).strip()
+            if _scp_mode not in ("last_working", "automatic"):
+                _scp_mode = preserved.scp_mode if preserved else "last_working"
+            # last_working_scp_mode is deployer-managed state; let the
+            # caller reset it (useful when the box's SSH stack changed)
+            # but default to keeping whatever we had.
+            if "last_working_scp_mode" in d:
+                _lw = str(d.get("last_working_scp_mode", "") or "")
+            else:
+                _lw = preserved.last_working_scp_mode if preserved else ""
             new_list.append(DeploymentConfig(
                 name=name,
                 enabled=bool(d.get("enabled", True)),
@@ -277,6 +292,8 @@ def _apply_patch_to_target(target: Target, patch: dict[str, Any]) -> None:
                 post_cmd=str(d.get("post_cmd", "")),
                 password=preserved.password if preserved else "",
                 su_password=preserved.su_password if preserved else "",
+                scp_mode=_scp_mode,
+                last_working_scp_mode=_lw,
             ))
         target.deployment = new_list
 

@@ -79,19 +79,68 @@ class Deployer:
             capture_output=True, text=True, timeout=timeout,
         )
 
+    # SCP mode table — name → extra argv passed to scp. The order is
+    # the fallback chain used by automatic mode and by last_working
+    # when the cache is cold or stale.
+    _SCP_MODES = (
+        ("default", []),
+        ("sftp", ["-s"]),
+        ("scp_protocol", ["-O"]),
+    )
+    _SCP_FAIL_LOG = {
+        "default": "  [yellow]SCP failed, trying SFTP mode (-s)...[/yellow]",
+        "sftp": "  [yellow]SFTP failed, trying SCP protocol (-O)...[/yellow]",
+    }
+
     def _scp(self, local: str, remote: str) -> subprocess.CompletedProcess:
-        """SCP deploy with 3-tier fallback (default → SFTP → SCP protocol)."""
-        cmd = self._sshpass + self._scp_base + [local, f"{self._ssh_target}:{remote}"]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-        if result.returncode != 0:
-            self._log("  [yellow]SCP failed, trying SFTP mode (-s)...[/yellow]")
-            cmd_s = self._sshpass + self._scp_base + ["-s", local, f"{self._ssh_target}:{remote}"]
-            result = subprocess.run(cmd_s, capture_output=True, text=True, timeout=60)
-        if result.returncode != 0:
-            self._log("  [yellow]SFTP failed, trying SCP protocol (-O)...[/yellow]")
-            cmd_o = self._sshpass + self._scp_base + ["-O", local, f"{self._ssh_target}:{remote}"]
-            result = subprocess.run(cmd_o, capture_output=True, text=True, timeout=60)
-        return result
+        """SCP deploy with 3-tier fallback (default → SFTP → SCP protocol).
+
+        When ``config.scp_mode == "last_working"`` (default) the cached
+        mode from the previous success is attempted first and the full
+        chain only runs on failure; whatever ultimately works is written
+        back to ``config.last_working_scp_mode`` so the caller can persist
+        it. ``"automatic"`` skips the cache and always runs the chain.
+        """
+        cfg = self.config
+        scp_mode = getattr(cfg, "scp_mode", "last_working") or "last_working"
+        cached = getattr(cfg, "last_working_scp_mode", "") or ""
+
+        def _run(extra_args: list[str]) -> subprocess.CompletedProcess:
+            cmd = self._sshpass + self._scp_base + extra_args + [
+                local, f"{self._ssh_target}:{remote}"
+            ]
+            return subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+
+        mode_map = dict(self._SCP_MODES)
+
+        # Last-working fast path: try the cached mode first.
+        if scp_mode == "last_working" and cached in mode_map:
+            result = _run(mode_map[cached])
+            if result.returncode == 0:
+                return result
+            # Cache was stale — fall through to the full chain and let
+            # it overwrite the cache with whatever actually works now.
+            self._log(
+                f"  [yellow]Cached SCP mode '{cached}' failed, retrying full chain...[/yellow]"
+            )
+
+        # Full fallback chain, always runs for "automatic" and as the
+        # fallback for "last_working".
+        result = None
+        for name, extra in self._SCP_MODES:
+            if result is not None and result.returncode != 0:
+                # Previous attempt failed; announce next step with the
+                # historical wording so existing log readers still parse.
+                prev = self._SCP_MODES[self._SCP_MODES.index((name, extra)) - 1][0]
+                msg = self._SCP_FAIL_LOG.get(prev)
+                if msg:
+                    self._log(msg)
+            result = _run(extra)
+            if result.returncode == 0:
+                if scp_mode == "last_working" and cached != name:
+                    cfg.last_working_scp_mode = name
+                return result
+        return result  # type: ignore[return-value]
 
     def _run_local(self, cmd: str, timeout: int = 10) -> subprocess.CompletedProcess:
         """Run a command locally."""
