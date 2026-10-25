@@ -35,11 +35,11 @@ libraries:
       uclibc: 'export CFLAGS="$CFLAGS -DOPENSSL_NO_ASYNC"'
       android: 'export ANDROID_NDK=@TOOLCHAIN@; unset CC; unset RANLIB'
     variants:
-      - version: "4.1.0-beta2"
-        label: "4.1.0 beta2 (experimental)"
+      - version: "4.1.0"
+        label: "4.1.x (latest)"
         requires: "c11"
       - version: "4.0.3"
-        label: "4.0.x (latest)"
+        label: "4.0.x (current)"
         requires: "c11"
       - version: "3.6.5"
         label: "3.6.x (current)"
