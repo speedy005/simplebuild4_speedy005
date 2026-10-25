@@ -197,6 +197,31 @@ def fetch_versions(version_check: str, lib_name: str) -> list[dict]:
     return []
 
 
+# Cache: lib_name → set of branch strings currently marked LTS upstream.
+_LTS_BRANCHES_CACHE: dict[str, set[str]] = {}
+
+
+def fetch_lts_branches(lib_name: str) -> set[str]:
+    """Which upstream branches are currently flagged as LTS?
+
+    GitHub release metadata doesn't carry this — OpenSSL publishes it
+    only on their release-policy page. For other libs we have no
+    reliable source, so return empty.
+    """
+    if lib_name in _LTS_BRANCHES_CACHE:
+        return _LTS_BRANCHES_CACHE[lib_name]
+    out: set[str] = set()
+    if lib_name == "OpenSSL":
+        try:
+            html = fetch_html("https://openssl-library.org/source/")
+            for m in re.finditer(r'(\d+\.\d+)\s*\[LTS\]', html):
+                out.add(m.group(1))
+        except Exception as e:
+            print(f"  WARNING: OpenSSL LTS scrape failed: {e}")
+    _LTS_BRANCHES_CACHE[lib_name] = out
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Update logic
 # ---------------------------------------------------------------------------
@@ -300,9 +325,11 @@ def find_obsolete_prereleases(lib: dict, all_versions: list[dict]) -> list[str]:
 
 
 def find_new_versions(lib: dict, all_versions: list[dict],
-                      updates: list[tuple[str, str]] | None = None) -> list[str]:
-    """Add pre-releases when no stable variant in the same branch
-    already supersedes them.
+                      updates: list[tuple[str, str]] | None = None) -> list[dict]:
+    """Propose new variants to add — stable branches we don't yet cover,
+    plus pre-releases not already superseded by any stable.
+
+    Returns a list of dicts: ``{"version", "prerelease", "branch"}``.
 
     ``updates`` is the output of ``find_updates`` for the same lib —
     we apply it conceptually so that a version about to be bumped in
@@ -317,37 +344,105 @@ def find_new_versions(lib: dict, all_versions: list[dict],
         existing_versions.discard(old)
         existing_versions.add(new)
 
-    branch_max: dict[str, tuple] = {}
-    seen_branches: set[str] = set()
+    # Branch-max from EXISTING stable variants + branches that already
+    # have a pre-release representative we don't want to duplicate.
+    existing_stable_branch_max: dict[str, tuple] = {}
+    existing_pre_branches: set[str] = set()
     for ver in existing_versions:
         if ver in ("auto", "master", "custom"):
             continue
+        # Skip fixed bitslice/anchor variants like 1.1.0-64 — not real pres.
+        if re.match(r'^\d+\.\d+\.\d+-\d+$', ver):
+            continue
         if is_prerelease(ver):
-            # A pre-release variant already represents this branch —
-            # don't add a second pre for the same branch.
-            seen_branches.add(get_branch(_release_form(ver)))
+            existing_pre_branches.add(get_branch(_release_form(ver)))
             continue
         b = get_branch(ver)
         pv = parse_version(ver)
-        if pv > branch_max.get(b, ()):
-            branch_max[b] = pv
+        if pv > existing_stable_branch_max.get(b, ()):
+            existing_stable_branch_max[b] = pv
 
-    new_versions = []
+    # Branch-max from UPSTREAM stable — needed so pre-releases get
+    # filtered the moment the equivalent stable ships upstream, even
+    # before our YAML catches up. Also used to pick the newest stable
+    # of each newly discovered upstream branch.
+    upstream_stable_newest: dict[str, dict] = {}
+    for av in all_versions:
+        if av["prerelease"]:
+            continue
+        b = get_branch(av["version"])
+        pv = parse_version(av["version"])
+        cur = upstream_stable_newest.get(b)
+        if cur is None or pv > parse_version(cur["version"]):
+            upstream_stable_newest[b] = av
 
+    new_entries: list[dict] = []
+    seen_new_branches: set[str] = set()
+
+    # Highest existing stable overall — the floor below which we never
+    # auto-add historical branches. Otherwise an initial run would
+    # flood the YAML with every ancient minor branch upstream ever had.
+    highest_existing_stable: tuple = max(
+        existing_stable_branch_max.values(), default=(),
+    )
+
+    # (1) NEW stable branches that are strictly newer than everything
+    # we currently cover. find_updates handles bumps within an existing
+    # branch; find_obsolete_prereleases handles pre→stable graduation
+    # of a tracked pre-release. We only step in when upstream shipped
+    # a brand-new, higher branch (e.g. 4.1.x once we only had 4.0.x).
+    #
+    # A note on branch granularity: get_branch strips one trailing
+    # segment, so "1.3.2" → "1.3" but "1.3" → "1". When upstream
+    # occasionally publishes a short tag (zlib ships "1.3" as a tag,
+    # not "1.3.0"), its coarse branch like "1" would look brand-new
+    # to us even though we track its finer-grained children (1.3.x).
+    # Treat an upstream branch as already covered when any existing
+    # branch has it as a prefix.
+    def _covered(upstream_branch: str) -> bool:
+        if upstream_branch in existing_stable_branch_max:
+            return True
+        prefix = upstream_branch + "."
+        return any(eb.startswith(prefix) for eb in existing_stable_branch_max)
+
+    for branch, av in upstream_stable_newest.items():
+        if _covered(branch):
+            continue  # bump path handles it, or finer branch already covers
+        if parse_version(av["version"]) <= highest_existing_stable:
+            continue  # older than our newest — don't backfill history
+        new_entries.append({
+            "version": av["version"],
+            "prerelease": False,
+            "branch": branch,
+        })
+        seen_new_branches.add(branch)
+
+    # (2) Pre-releases — only if not already superseded by any stable
+    # (existing OR upstream) and not already represented in our YAML.
     for av in all_versions:
         if not av["prerelease"]:
             continue
         if av["version"] in existing_versions:
             continue
         b = get_branch(_release_form(av["version"]))
-        if b in seen_branches:
+        if b in existing_pre_branches:
             continue  # one pre per branch is enough
-        if parse_version(av["version"]) <= branch_max.get(b, ()):
-            continue  # superseded by existing stable
-        new_versions.append(av["version"])
-        seen_branches.add(b)
+        if b in seen_new_branches:
+            continue  # we just added a stable for this branch — don't also add a pre
+        pv = parse_version(av["version"])
+        if pv <= existing_stable_branch_max.get(b, ()):
+            continue
+        upstream_cur = upstream_stable_newest.get(b)
+        if upstream_cur is not None and pv <= parse_version(upstream_cur["version"]):
+            continue  # upstream has shipped a stable >= this pre
+        new_entries.append({
+            "version": av["version"],
+            "prerelease": True,
+            "branch": b,
+        })
+        seen_new_branches.add(b)
 
-    return new_versions
+    return new_entries
 
 
 # ---------------------------------------------------------------------------
@@ -461,15 +556,88 @@ def apply_removals(content: str, removals: list[str], lib_name: str) -> tuple[st
     return content, changes
 
 
-def apply_new_versions(content: str, new_versions: list[str], lib_name: str) -> tuple[str, list[str]]:
-    """Insert new pre-release variants into YAML content.
+def apply_new_versions(content: str, new_entries: list[dict], lib: dict) -> tuple[str, list[str]]:
+    """Insert new variants into YAML content.
 
-    Inserts before the first existing variant of the library.
+    Each entry is a dict ``{"version", "prerelease", "branch"}`` as
+    returned by ``find_new_versions``. Pre-releases get an
+    "(experimental)" label; stable branches that we didn't cover yet
+    get an "X.Y.x (latest)" or "X.Y.x (LTS)" label (LTS detected via
+    ``fetch_lts_branches``). When a new (latest) is inserted, any
+    existing "(latest)" label in the same library is downgraded to
+    "(current)" so only the newest stable carries the top marker.
+    ``requires`` is inherited from the closest existing stable variant
+    so unrelated anchors like 1.1.0 don't drag their own requirements
+    onto a brand-new 4.x branch.
+
+    Insertion is always at the top (first variant position), so a new
+    stable branch like 4.1.0 lands above the previously-newest 4.0.x.
     """
+    lib_name = lib["name"]
     changes = []
-    for ver in new_versions:
-        # Find insertion point: first "    variants:" under the library, then first "      - version:"
-        # We insert the new variant as the first entry after "variants:"
+
+    # Pre-compute "requires:" default — reuse the value from the
+    # highest existing stable variant (bitslice anchors ignored).
+    inherited_requires = ""
+    best_pv = ()
+    for v in lib.get("variants", []):
+        ver = v.get("version", "")
+        if ver in ("auto", "master", "custom"):
+            continue
+        if re.match(r'^\d+\.\d+\.\d+-\d+$', ver):
+            continue
+        if is_prerelease(ver):
+            continue
+        pv = parse_version(ver)
+        if pv > best_pv:
+            best_pv = pv
+            inherited_requires = str(v.get("requires", "") or "")
+
+    lts_branches = fetch_lts_branches(lib_name) if any(
+        not e["prerelease"] for e in new_entries) else set()
+
+    # Insert in descending version order so the newest variant ends
+    # up topmost. apply_new_versions always inserts at the first
+    # variant position; inserting in reverse order means each later
+    # insert lands above the previous.
+    sorted_entries = sorted(
+        new_entries,
+        key=lambda e: parse_version(e["version"]),
+    )
+
+    for entry in sorted_entries:
+        ver = entry["version"]
+        is_pre = entry["prerelease"]
+        branch = entry.get("branch", "")
+
+        # Build label
+        if is_pre:
+            label = f'{ver.replace("-", " ")} (experimental)'
+            tag = "prerelease"
+        else:
+            suffix = "LTS" if branch in lts_branches else "latest"
+            label = f'{branch}.x ({suffix})'
+            tag = suffix.lower()
+
+        # Downgrade any pre-existing "(latest)" label in this library's
+        # block before computing insert positions, so the new stable
+        # top is the only one carrying it. Scoped to the library block
+        # to leave other libraries alone; (LTS) and (current) are
+        # untouched.
+        if suffix == "latest":
+            lib_block_start = content.find(f"name: {lib_name}")
+            if lib_block_start != -1:
+                next_lib_pos = content.find("\n  - name:", lib_block_start + 1)
+                block_end = next_lib_pos if next_lib_pos != -1 else len(content)
+                block = content[lib_block_start:block_end]
+                relabeled = block.replace(' (latest)"', ' (current)"')
+                if relabeled != block:
+                    content = content[:lib_block_start] + relabeled + content[block_end:]
+                    changes.append(f"{lib_name}: RELABEL previous (latest) -> (current)")
+
+        # Find insertion point: first "- version:" after the library's
+        # "variants:" marker. New entry is placed before that line, so
+        # it becomes the new topmost variant.
         lib_pattern = f"name: {lib_name}"
         lib_pos = content.find(lib_pattern)
         if lib_pos == -1:
@@ -477,24 +645,23 @@ def apply_new_versions(content: str, new_versions: list[str], lib_name: str) -> 
         variants_pos = content.find("variants:", lib_pos)
         if variants_pos == -1:
             continue
-        # Find the first "- version:" after variants:
         first_variant_pos = content.find("- version:", variants_pos)
         if first_variant_pos == -1:
             continue
-        # Extract the existing line to copy its exact indentation
         line_start = content.rfind("\n", 0, first_variant_pos) + 1
         existing_line = content[line_start:content.find("\n", first_variant_pos)]
-        # Get whitespace before "- version:"
         indent = existing_line[:len(existing_line) - len(existing_line.lstrip())]
 
-        new_entry = (
-            f'{indent}- version: "{ver}"\n'
-            f'{indent}  label: "{ver.replace("-", " ")} (experimental)"\n'
-            f'{indent}  requires: "c11"\n'
-        )
-        first_variant_pos = line_start  # insert before the whole line
-        content = content[:first_variant_pos] + new_entry + content[first_variant_pos:]
-        changes.append(f"{lib_name}: NEW {ver} (prerelease)")
+        lines = [
+            f'{indent}- version: "{ver}"',
+            f'{indent}  label: "{label}"',
+        ]
+        if inherited_requires:
+            lines.append(f'{indent}  requires: "{inherited_requires}"')
+        new_entry = "\n".join(lines) + "\n"
+
+        content = content[:line_start] + new_entry + content[line_start:]
+        changes.append(f"{lib_name}: NEW {ver} ({tag})")
 
     return content, changes
 
@@ -535,7 +702,7 @@ def main():
             if not dry_run:
                 content, rem_changes = apply_removals(content, obsolete, name)
                 content, changes = apply_updates(content, updates, name)
-                content, new_changes = apply_new_versions(content, new_vers, name)
+                content, new_changes = apply_new_versions(content, new_vers, lib)
                 all_changes.extend(rem_changes + changes + new_changes)
             else:
                 for ov in obsolete:
@@ -545,8 +712,9 @@ def main():
                     print(f"    {name}: {old_v} → {new_v}")
                     all_changes.append(f"{name}: {old_v} → {new_v}")
                 for nv in new_vers:
-                    print(f"    {name}: NEW {nv} (prerelease)")
-                    all_changes.append(f"{name}: NEW {nv} (prerelease)")
+                    kind = "prerelease" if nv["prerelease"] else "stable"
+                    print(f"    {name}: NEW {nv['version']} ({kind}, branch {nv['branch']})")
+                    all_changes.append(f"{name}: NEW {nv['version']} ({kind})")
         else:
             print(f"    up to date")
 
