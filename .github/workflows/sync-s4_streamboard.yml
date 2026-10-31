@@ -1,0 +1,157 @@
+
+name: Sync simplebuild4 with Streamboard
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: sync-simplebuild4-master
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Update master from Streamboard
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout GitHub repository
+        uses: actions/checkout@v5
+        with:
+          ref: master
+          fetch-depth: 0
+          token: ${{ github.token }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add upstream https://git.streamboard.tv/common/simplebuild4.git
+          git fetch upstream master
+          git fetch origin master
+
+      - name: Synchronize and preserve GitHub workflows
+        shell: bash
+        env:
+          GH_WORKFLOW_DIR: .github/workflows
+        run: |
+          set -euo pipefail
+
+          git checkout master
+
+          # Back up the GitHub Actions workflow files.
+          BACKUP_DIR="$(mktemp -d)"
+          if [ -d "$GH_WORKFLOW_DIR" ]; then
+            cp -a "$GH_WORKFLOW_DIR" "$BACKUP_DIR/workflows"
+          fi
+
+          UPSTREAM_COMMIT="$(git rev-parse upstream/master)"
+
+          # Synchronize tracked files with Streamboard.
+          git reset --hard upstream/master
+
+          # Restore GitHub workflow files.
+          if [ -d "$BACKUP_DIR/workflows" ]; then
+            mkdir -p "$GH_WORKFLOW_DIR"
+            cp -a "$BACKUP_DIR/workflows/." "$GH_WORKFLOW_DIR/"
+          fi
+
+          # Commit preserved workflows if needed.
+          git add -A -- "$GH_WORKFLOW_DIR"
+
+          if ! git diff --cached --quiet; then
+            git commit -m "Preserve GitHub Actions workflows"
+          fi
+
+          echo "UPSTREAM_COMMIT=$UPSTREAM_COMMIT" >> "$GITHUB_ENV"
+          echo "Upstream commit: $UPSTREAM_COMMIT"
+          echo "Local commit: $(git rev-parse HEAD)"
+
+      - name: Push updates to GitHub
+        shell: bash
+        run: |
+          set -euo pipefail
+          git push --force-with-lease origin master
+
+      - name: Verify synchronization
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git fetch origin master
+
+          # Verify upstream files outside .github/workflows.
+          git diff --exit-code \
+            "$UPSTREAM_COMMIT" origin/master \
+            -- . ':(exclude).github/workflows/**'
+
+          # Confirm that the workflow directory survived.
+          git cat-file -e origin/master:.github/workflows
+
+          echo "Synchronization verified successfully."
+
+      - name: Create issue on synchronization failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TITLE="[simplebuild4 Sync] Upstream synchronization failed"
+
+          BODY=$(cat <<EOF
+          Die automatische Synchronisierung von Streamboard ist fehlgeschlagen.
+
+          **Upstream:** https://git.streamboard.tv/common/simplebuild4
+          **GitHub-Repository:** https://github.com/${GH_REPO}
+          **Branch:** master
+
+          Mögliche Ursachen:
+          - Streamboard nicht erreichbar
+          - Der Branch master existiert nicht
+          - Push- oder Berechtigungsfehler
+          - Branch-Schutzregeln verhindern das Aktualisieren
+
+          [Workflow-Ausführung und Fehlerprotokoll ansehen](${RUN_URL})
+          EOF
+          )
+
+          gh label create sync-error \
+            --repo "$GH_REPO" \
+            --color "d73a4a" \
+            --description "Automatic synchronization errors" \
+            2>/dev/null || true
+
+          EXISTING_ISSUE="$(gh issue list \
+            --repo "$GH_REPO" \
+            --state open \
+            --label sync-error \
+            --json number,title \
+            --jq '.[] | select(.title == "[simplebuild4 Sync] Upstream synchronization failed") | .number' \
+            | head -n 1)"
+
+          if [ -n "$EXISTING_ISSUE" ]; then
+            gh issue comment "$EXISTING_ISSUE" \
+              --repo "$GH_REPO" \
+              --body "$BODY"
+          else
+            gh issue create \
+              --repo "$GH_REPO" \
+              --title "$TITLE" \
+              --label sync-error \
+              --body "$BODY"
+          fi
