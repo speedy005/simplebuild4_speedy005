@@ -397,16 +397,20 @@ def find_new_versions(lib: dict, all_versions: list[dict],
     # occasionally publishes a short tag (zlib ships "1.3" as a tag,
     # not "1.3.0"), its coarse branch like "1" would look brand-new
     # to us even though we track its finer-grained children (1.3.x).
-    # Treat an upstream branch as already covered when any existing
-    # branch has it as a prefix.
-    def _covered(upstream_branch: str) -> bool:
+    # Treat such an upstream branch as covered only when a finer
+    # existing branch actually reaches the upstream version — a genuine
+    # step up like 1.3.x → 1.4 must NOT be hidden by the prefix match.
+    def _covered(upstream_branch: str, upstream_pv: tuple) -> bool:
         if upstream_branch in existing_stable_branch_max:
             return True
         prefix = upstream_branch + "."
-        return any(eb.startswith(prefix) for eb in existing_stable_branch_max)
+        for eb, eb_pv in existing_stable_branch_max.items():
+            if eb.startswith(prefix) and eb_pv >= upstream_pv:
+                return True
+        return False
 
     for branch, av in upstream_stable_newest.items():
-        if _covered(branch):
+        if _covered(branch, parse_version(av["version"])):
             continue  # bump path handles it, or finer branch already covers
         if parse_version(av["version"]) <= highest_existing_stable:
             continue  # older than our newest — don't backfill history
