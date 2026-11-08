@@ -246,7 +246,7 @@ libraries:
     pre_configure: "autoreconf -i"
     configure: "./configure --host=@TARGET@ --prefix=@PREFIX@ $OPTIMIZATION"
     make: "make -j@CPUS@"
-    install: "make install && mkdir -p @PREFIX@/lib/pkgconfig && echo -e \"prefix=@PREFIX@\nexec_prefix=@PREFIX@\nlibdir=@PREFIX@/lib\nincludedir=@PREFIX@/include\n\nName: libdvbcsa\nDescription: DVB Common Scrambling algorithm (${BITSLICE:-unknown})\nVersion: 1.1.0-${BATCHSIZE:-0}-${BITSLICE:-unknown}\nCflags: -I@PREFIX@/include\nLibs: -L@PREFIX@/lib -ldvbcsa\" > @PREFIX@/lib/pkgconfig/libdvbcsa.pc"
+    install: "make install"
     extra:
       "post:csky": 'for f in $(find . -name config.sub); do grep -q "csky" "$f" || sed -i "s/| mcore | mep | metag /| mcore | mep | metag | csky /;s/| mcore-\* | metag-\* /| mcore-* | metag-* | csky-* /" "$f"; done'
       fix_includes: |
@@ -258,6 +258,7 @@ libraries:
       auto_bitslice: |
         OPT=""; BATCHSIZE="32"; BITSLICE="uint32"
         echo "#include <altivec.h>" | @CC@ @CFLAGS@ -maltivec -c -x c -o /dev/null - 2>/dev/null && OPT="--enable-altivec" && BATCHSIZE="128" && BITSLICE="altivec"
+        [ -z "$OPT" ] && @CC@ --target-help 2>&1 | grep -qiw avx512f && OPT="--enable-avx512" && BATCHSIZE="512" && BITSLICE="avx512"
         [ -z "$OPT" ] && @CC@ --target-help 2>&1 | grep -qiw avx2 && OPT="--enable-avx2" && BATCHSIZE="256" && BITSLICE="avx2"
         [ -z "$OPT" ] && @CC@ --target-help 2>&1 | grep -qiw ssse3 && OPT="--enable-ssse3" && BATCHSIZE="128" && BITSLICE="ssse3"
         [ -z "$OPT" ] && @CC@ --target-help 2>&1 | grep -qiw sse2 && OPT="--enable-sse2" && BATCHSIZE="128" && BITSLICE="sse2"
@@ -268,14 +269,14 @@ libraries:
         export OPTIMIZATION="$OPT"
     variants:
       - version: "auto"
-        label: "1.1.0 (autodetect bitslice)"
-      - version: "1.1.0-64"
-        label: "1.1.0 uint64 (force)"
+        label: "1.2.0 (autodetect bitslice)"
+      - version: "1.2.0-64"
+        label: "1.2.0 uint64 (force)"
         extra:
           auto_bitslice: 'BATCHSIZE="64"; BITSLICE="uint64"; export OPTIMIZATION="--enable-uint64"'
         configure: "./configure --host=@TARGET@ --prefix=@PREFIX@ --enable-uint64"
-      - version: "1.1.0-32"
-        label: "1.1.0 uint32 (force)"
+      - version: "1.2.0-32"
+        label: "1.2.0 uint32 (force)"
         extra:
           auto_bitslice: 'BATCHSIZE="32"; BITSLICE="uint32"; export OPTIMIZATION="--enable-uint32"'
         configure: "./configure --host=@TARGET@ --prefix=@PREFIX@ --enable-uint32"
